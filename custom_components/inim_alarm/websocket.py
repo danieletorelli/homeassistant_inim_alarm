@@ -22,6 +22,67 @@ HEARTBEAT_TIMEOUT = (PING_INTERVAL * 2) + 30
 RECONNECT_BASE_DELAY = 3.0
 RECONNECT_MAX_DELAY = 60.0
 RECONNECT_JITTER = 0.2
+LOG_REDACTED = "**REDACTED**"
+WS_LOG_SENSITIVE_KEYS = {
+    "deviceeventid",
+    "deviceid",
+    "id",
+    "name",
+    "ulid",
+}
+
+
+def _redact_ws_message_for_log(text: str) -> str:
+    """Redact sensitive values while preserving WebSocket debug details."""
+    if text == HEARTBEAT_PAYLOAD:
+        return text
+
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return "**UNPARSEABLE MESSAGE REDACTED**"
+
+    return json.dumps(
+        _redact_ws_value_for_log(payload),
+        separators=(",", ":"),
+    )
+
+
+def _redact_ws_value_for_log(value: Any) -> Any:
+    """Return a redacted copy of a nested WebSocket value."""
+    if isinstance(value, dict):
+        redacted: dict[Any, Any] = {}
+        for key, item in value.items():
+            normalized_key = "".join(
+                character
+                for character in str(key).casefold()
+                if character.isalnum()
+            )
+            if normalized_key in WS_LOG_SENSITIVE_KEYS:
+                redacted[key] = LOG_REDACTED
+            elif normalized_key == "data" and isinstance(item, str):
+                redacted[key] = _redact_nested_json_for_log(item)
+            else:
+                redacted[key] = _redact_ws_value_for_log(item)
+        return redacted
+
+    if isinstance(value, list):
+        return [_redact_ws_value_for_log(item) for item in value]
+
+    return value
+
+
+def _redact_nested_json_for_log(value: str) -> str:
+    """Redact a JSON string nested inside a WebSocket event."""
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return LOG_REDACTED
+
+    return json.dumps(
+        _redact_ws_value_for_log(parsed),
+        separators=(",", ":"),
+    )
 
 
 class InimWebSocketClient:
@@ -148,7 +209,10 @@ class InimWebSocketClient:
 
     def _handle_message(self, text: str) -> None:
         """Parse and dispatch a WebSocket message."""
-        _LOGGER.debug("Raw WS message: %r", text)
+        _LOGGER.debug(
+            "WS message: %r",
+            _redact_ws_message_for_log(text),
+        )
 
         if text == HEARTBEAT_PAYLOAD:
             _LOGGER.debug("Received INIM WS heartbeat")
