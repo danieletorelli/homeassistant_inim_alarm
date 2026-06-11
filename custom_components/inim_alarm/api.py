@@ -33,6 +33,72 @@ _LOGGER = logging.getLogger(__name__)
 RATE_LIMIT_BASE_DELAY = 30.0
 RATE_LIMIT_MAX_DELAY = 900.0
 RATE_LIMIT_JITTER = 0.2
+LOG_REDACTED = "**REDACTED**"
+API_LOG_SENSITIVE_KEYS = {
+    "address",
+    "clientid",
+    "clienttoken",
+    "deviceid",
+    "email",
+    "imei",
+    "internalname",
+    "ipaddress",
+    "lat",
+    "latitude",
+    "lng",
+    "longitude",
+    "mac",
+    "macaddress",
+    "mobile",
+    "name",
+    "password",
+    "phone",
+    "primaryipaddress",
+    "secondaryipaddress",
+    "serialnumber",
+    "token",
+    "userid",
+    "username",
+}
+
+
+def _redact_api_value_for_log(value: Any) -> Any:
+    """Return a redacted copy while preserving API debug details."""
+    if isinstance(value, dict):
+        redacted: dict[Any, Any] = {}
+        for key, item in value.items():
+            normalized_key = "".join(
+                character
+                for character in str(key).casefold()
+                if character.isalnum()
+            )
+            if normalized_key in API_LOG_SENSITIVE_KEYS:
+                redacted[key] = (
+                    item if item is None or item == "" else LOG_REDACTED
+                )
+            elif normalized_key == "data" and isinstance(item, str):
+                redacted[key] = _redact_nested_api_json_for_log(item)
+            else:
+                redacted[key] = _redact_api_value_for_log(item)
+        return redacted
+
+    if isinstance(value, list):
+        return [_redact_api_value_for_log(item) for item in value]
+
+    return value
+
+
+def _redact_nested_api_json_for_log(value: str) -> str:
+    """Redact a JSON string nested inside an API response."""
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return LOG_REDACTED
+
+    return json.dumps(
+        _redact_api_value_for_log(parsed),
+        separators=(",", ":"),
+    )
 
 
 class InimApiError(Exception):
@@ -294,7 +360,10 @@ class InimApi:
         try:
             response = await self._request(request_data)
             self._devices = response.get("Data", {}).get("Devices", [])
-            _LOGGER.debug("GetDevicesExtended raw data: %s", self._devices)
+            _LOGGER.debug(
+                "GetDevicesExtended data (sensitive values redacted): %s",
+                _redact_api_value_for_log(self._devices),
+            )
             return self._devices
         except InimAuthError:
             # Token expired, re-authenticate and retry
