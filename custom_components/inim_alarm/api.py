@@ -5,7 +5,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
+import time
 import uuid
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any
 from urllib.parse import quote
 
@@ -26,6 +30,10 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
+RATE_LIMIT_BASE_DELAY = 30.0
+RATE_LIMIT_MAX_DELAY = 900.0
+RATE_LIMIT_JITTER = 0.2
+
 
 class InimApiError(Exception):
     """Exception for INIM API errors."""
@@ -38,6 +46,15 @@ class InimApiError(Exception):
 
 class InimAuthError(InimApiError):
     """Exception for authentication errors."""
+
+
+class InimRateLimitError(InimApiError):
+    """Exception raised when INIM Cloud rate limits requests."""
+
+    def __init__(self, message: str, retry_after: float) -> None:
+        """Initialize the exception."""
+        super().__init__(message, 429)
+        self.retry_after = retry_after
 
 
 class InimApi:
@@ -58,6 +75,9 @@ class InimApi:
         self._token_ttl: int = 0
         self._client_id = f"ha-{uuid.uuid4()}"
         self._devices: list[dict[str, Any]] = []
+        self._request_lock = asyncio.Lock()
+        self._rate_limit_until = 0.0
+        self._rate_limit_failures = 0
 
     async def _get_session(self) -> aiohttp.ClientSession:
         """Get or create aiohttp session."""
@@ -74,37 +94,114 @@ class InimApi:
     async def _request(self, request_data: dict[str, Any]) -> dict[str, Any]:
         """Make a request to the INIM API."""
         session = await self._get_session()
-        
+
         # URL encode the JSON request
         req_json = json.dumps(request_data, separators=(",", ":"))
         url = f"{API_BASE_URL}?req={quote(req_json)}"
-        
+
         # Log only method name, never credentials or tokens
-        _LOGGER.debug("API Request: %s", request_data.get("Method"))
-        
+        method = request_data.get("Method")
+
+        async with self._request_lock:
+            retry_after = self.rate_limit_remaining
+            if retry_after > 0:
+                raise InimRateLimitError(
+                    f"INIM Cloud rate limit cooldown active for {retry_after:.1f}s",
+                    retry_after,
+                )
+
+            _LOGGER.debug("API Request: %s", method)
+
+            try:
+                async with session.get(url, headers=API_HEADERS) as response:
+                    if response.status == 429:
+                        retry_after = self._register_rate_limit(
+                            response.headers.get("Retry-After")
+                        )
+                        _LOGGER.warning(
+                            "INIM Cloud rate limited %s requests; retrying allowed in %.1fs",
+                            method,
+                            retry_after,
+                        )
+                        raise InimRateLimitError(
+                            f"Too many requests; retry after {retry_after:.1f}s",
+                            retry_after,
+                        )
+
+                    response.raise_for_status()
+                    data = await response.json()
+                    self._clear_rate_limit()
+
+                    _LOGGER.debug("API Response Status: %s", data.get("Status"))
+
+                    if data.get("Status") != 0:
+                        error_msg = data.get("ErrMsg", "Unknown error")
+                        error_code = data.get("Status", 0)
+
+                        # Check for authentication errors
+                        if error_code in (18, 19, 20, 27):  # Token expired/invalid
+                            _LOGGER.debug(
+                                "Token expired/invalid (code %s), invalidating token",
+                                error_code,
+                            )
+                            self._token = None
+                            raise InimAuthError(error_msg, error_code)
+
+                        raise InimApiError(error_msg, error_code)
+
+                    return data
+
+            except InimRateLimitError:
+                raise
+            except aiohttp.ClientError as err:
+                raise InimApiError(f"Connection error: {err}") from err
+
+    def _register_rate_limit(self, retry_after_header: str | None) -> float:
+        """Record a rate limit response and return the cooldown duration."""
+        self._rate_limit_failures += 1
+        retry_after = self._parse_retry_after(retry_after_header)
+
+        if retry_after is None:
+            backoff = min(
+                RATE_LIMIT_BASE_DELAY * (2 ** (self._rate_limit_failures - 1)),
+                RATE_LIMIT_MAX_DELAY,
+            )
+            jitter = 1 + random.uniform(-RATE_LIMIT_JITTER, RATE_LIMIT_JITTER)
+            retry_after = max(1.0, backoff * jitter)
+        else:
+            retry_after = max(1.0, retry_after)
+
+        self._rate_limit_until = time.monotonic() + retry_after
+        return retry_after
+
+    @staticmethod
+    def _parse_retry_after(retry_after_header: str | None) -> float | None:
+        """Parse a Retry-After header expressed as seconds or an HTTP date."""
+        if not retry_after_header:
+            return None
+
         try:
-            async with session.get(url, headers=API_HEADERS) as response:
-                response.raise_for_status()
-                data = await response.json()
-                
-                _LOGGER.debug("API Response Status: %s", data.get("Status"))
-                
-                if data.get("Status") != 0:
-                    error_msg = data.get("ErrMsg", "Unknown error")
-                    error_code = data.get("Status", 0)
-                    
-                    # Check for authentication errors
-                    if error_code in (18, 19, 20, 27):  # Token expired/invalid
-                        _LOGGER.debug("Token expired/invalid (code %s), invalidating token", error_code)
-                        self._token = None
-                        raise InimAuthError(error_msg, error_code)
-                    
-                    raise InimApiError(error_msg, error_code)
-                
-                return data
-                
-        except aiohttp.ClientError as err:
-            raise InimApiError(f"Connection error: {err}") from err
+            return max(0.0, float(retry_after_header))
+        except ValueError:
+            pass
+
+        try:
+            retry_at = parsedate_to_datetime(retry_after_header)
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=timezone.utc)
+
+        return max(
+            0.0,
+            (retry_at - datetime.now(timezone.utc)).total_seconds(),
+        )
+
+    def _clear_rate_limit(self) -> None:
+        """Clear rate limit backoff after a successful HTTP request."""
+        self._rate_limit_until = 0.0
+        self._rate_limit_failures = 0
 
     async def authenticate(self) -> bool:
         """Authenticate with INIM Cloud and get token."""
@@ -115,7 +212,7 @@ class InimApi:
             "brand": "HomeAssistant",
             "platform": "linux",
         })
-        
+
         request_data = {
             "Node": "",
             "Name": "",
@@ -133,20 +230,20 @@ class InimApi:
                 "Brand": "0",
             },
         }
-        
+
         try:
             response = await self._request(request_data)
             data = response.get("Data", {})
-            
+
             self._token = data.get("Token")
             self._token_ttl = data.get("TTL", 86400)
-            
+
             if not self._token:
                 raise InimAuthError("No token received")
-            
+
             _LOGGER.info("Successfully authenticated with INIM Cloud")
             return True
-            
+
         except InimApiError as err:
             _LOGGER.error("Authentication failed: %s", err)
             raise
@@ -159,7 +256,7 @@ class InimApi:
     async def request_poll(self, device_id: int) -> None:
         """Request a poll for updated data."""
         await self._ensure_authenticated()
-        
+
         request_data = {
             "Params": {"DeviceId": device_id, "Type": 5},
             "Node": "",
@@ -170,7 +267,7 @@ class InimApi:
             "ClientId": self._client_id,
             "Context": "intrusion",
         }
-        
+
         try:
             await self._request(request_data)
         except InimAuthError:
@@ -182,7 +279,7 @@ class InimApi:
     async def get_devices(self) -> list[dict[str, Any]]:
         """Get all devices with extended information."""
         await self._ensure_authenticated()
-        
+
         request_data = {
             "Node": "inimhome",
             "Name": "it.inim.inimutenti",
@@ -193,7 +290,7 @@ class InimApi:
             "Context": None,
             "Params": {"Info": "16908287"},
         }
-        
+
         try:
             response = await self._request(request_data)
             self._devices = response.get("Data", {}).get("Devices", [])
@@ -210,7 +307,7 @@ class InimApi:
     async def activate_scenario(self, device_id: int, scenario_id: int) -> bool:
         """Activate a scenario (arm/disarm)."""
         await self._ensure_authenticated()
-        
+
         request_data = {
             "Node": "inimhome",
             "Name": "it.inim.inimutenti",
@@ -224,7 +321,7 @@ class InimApi:
                 "DeviceId": device_id,
             },
         }
-        
+
         try:
             await self._request(request_data)
             _LOGGER.info("Scenario %s activated for device %s", scenario_id, device_id)
@@ -263,9 +360,9 @@ class InimApi:
             True if successful
         """
         await self._ensure_authenticated()
-        
+
         mode = BYPASS_MODE_BYPASS if bypass else BYPASS_MODE_NORMAL
-        
+
         request_data = {
             "Node": "inimhome",
             "Name": "it.inim.inimutenti",
@@ -281,7 +378,7 @@ class InimApi:
                 "Value": 0,
             },
         }
-        
+
         try:
             await self._request(request_data)
             action = "bypassed" if bypass else "reinstated"
@@ -309,10 +406,10 @@ class InimApi:
             True if successful
         """
         await self._ensure_authenticated()
-        
+
         # Mode: 0 = arm (Armed=1), 3 = disarm (Armed=4)
         mode = 0 if arm else 3
-        
+
         request_data = {
             "Node": "inimhome",
             "Name": "it.inim.inimutenti",
@@ -327,7 +424,7 @@ class InimApi:
                 "Code": user_code,
             },
         }
-        
+
         try:
             await self._request(request_data)
             action = "armed" if arm else "disarmed"
@@ -363,3 +460,13 @@ class InimApi:
     def is_authenticated(self) -> bool:
         """Return if we have a valid token."""
         return self._token is not None
+
+    @property
+    def rate_limit_remaining(self) -> float:
+        """Return the remaining shared API cooldown in seconds."""
+        return max(0.0, self._rate_limit_until - time.monotonic())
+
+    @property
+    def is_rate_limited(self) -> bool:
+        """Return whether API requests are currently rate limited."""
+        return self.rate_limit_remaining > 0
