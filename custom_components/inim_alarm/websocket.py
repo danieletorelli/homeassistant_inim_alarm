@@ -148,7 +148,8 @@ class InimWebSocketClient:
 
     def _handle_message(self, text: str) -> None:
         """Parse and dispatch a WebSocket message."""
-        text = text.strip()
+        _LOGGER.debug("Raw WS message: %r", text)
+
         if text == HEARTBEAT_PAYLOAD:
             _LOGGER.debug("Received INIM WS heartbeat")
             return
