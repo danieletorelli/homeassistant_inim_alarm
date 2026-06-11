@@ -8,6 +8,7 @@ DOMAIN = "inim_alarm"
 CONF_USERNAME = "username"
 CONF_PASSWORD = "password"
 CONF_SCAN_INTERVAL = "scan_interval"
+CONF_FULL_REFRESH_INTERVAL = "full_refresh_interval"
 # Legacy scenario config (removed in v2.0 - now uses InsertAreas API)
 # CONF_ARM_AWAY_SCENARIO = "arm_away_scenario"
 # CONF_ARM_HOME_SCENARIO = "arm_home_scenario"
@@ -39,19 +40,24 @@ METHOD_INSERT_ZONE = "InsertZone"
 
 # Default values
 DEFAULT_SCAN_INTERVAL = timedelta(seconds=30)
+DEFAULT_FULL_REFRESH_INTERVAL = timedelta(seconds=300)
+MIN_SCAN_INTERVAL_SECONDS = 20
+MAX_SCAN_INTERVAL_SECONDS = 300
+MIN_FULL_REFRESH_INTERVAL_SECONDS = 60
+MAX_FULL_REFRESH_INTERVAL_SECONDS = 3600
 DEFAULT_CLIENT_NAME = "HomeAssistant"
 
 # Zone Status (from API, subtract 1 for binary state)
 ZONE_STATUS_CLOSED = 1  # After -1 = 0 (False/Closed)
-ZONE_STATUS_OPEN = 2    # After -1 = 1 (True/Open)
+ZONE_STATUS_OPEN = 2  # After -1 = 1 (True/Open)
 
 # Area Armed Status
 AREA_ARMED_DISARMED = 4
 AREA_ARMED_ARMED = 1
 
 # Scenario IDs (these are common defaults, actual values come from API)
-SCENARIO_TOTAL = 0      # Arm all
-SCENARIO_DISARMED = 1   # Disarm all
+SCENARIO_TOTAL = 0  # Arm all
+SCENARIO_DISARMED = 1  # Disarm all
 
 # Device info
 MANUFACTURER = "INIM Electronics"
@@ -73,8 +79,8 @@ ATTR_TAMPER_MEMORY = "tamper_memory"
 ATTR_BYPASSED = "bypassed"
 
 # Bypass modes
-BYPASS_MODE_NORMAL = 0    # Reinserisci zona (toglie bypass)
-BYPASS_MODE_BYPASS = 3    # Bypassa zona
+BYPASS_MODE_NORMAL = 0  # Reinserisci zona (toglie bypass)
+BYPASS_MODE_BYPASS = 3  # Bypassa zona
 
 # Service names
 SERVICE_BYPASS_ZONE = "bypass_zone"

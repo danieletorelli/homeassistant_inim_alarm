@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -11,12 +13,13 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util
 
-from .api import InimApi, InimApiError, InimAuthError
+from .api import InimApi, InimApiError, InimAuthError, InimRateLimitError
 from .websocket import InimWebSocketClient
 from .const import (
     CHANGED_BY_EXTERNAL,
     CHANGED_BY_HOME_ASSISTANT,
     CHANGED_BY_UNKNOWN,
+    DEFAULT_FULL_REFRESH_INTERVAL,
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
     EVENT_ALARM_TRIGGERED,
@@ -24,6 +27,8 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+PANEL_SYNC_DELAY = 5.0
 
 
 class InimDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
@@ -35,7 +40,8 @@ class InimDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self,
         hass: HomeAssistant,
         api: InimApi,
-        update_interval: timedelta = DEFAULT_SCAN_INTERVAL,
+        update_interval: timedelta = DEFAULT_FULL_REFRESH_INTERVAL,
+        scan_interval: timedelta = DEFAULT_SCAN_INTERVAL,
     ) -> None:
         """Initialize the coordinator."""
         super().__init__(
@@ -45,8 +51,13 @@ class InimDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             update_interval=update_interval,
         )
         self.api = api
+        self._scan_interval = scan_interval
         self._ws_client = InimWebSocketClient(api, self._on_websocket_update)
         self._devices: list[dict[str, Any]] = []
+        self._poll_task: asyncio.Task | None = None
+        self._sync_lock = asyncio.Lock()
+        self._last_poll_by_device: dict[int, float] = {}
+        self._force_poll_on_refresh = False
         # Track previous alarm state for event triggering
         self._previous_alarm_states: dict[tuple[int, int], bool] = {}
         # Track previous armed states for change detection
@@ -58,52 +69,27 @@ class InimDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._last_changed_at: dict[str, datetime] = {}
 
     async def _async_update_data(self) -> dict[str, Any]:
-        """Fetch data from INIM API."""
+        """Fetch a full state snapshot from INIM Cloud."""
+        force_poll = self._force_poll_on_refresh
+        self._force_poll_on_refresh = False
+
         try:
-            # First, request poll to wake up the central unit
-            # This tells INIM to fetch fresh data from the panel
-            poll_requested = False
-            for device in self._devices:
-                device_id = device.get("DeviceId")
-                if device_id:
-                    try:
-                        await self.api.request_poll(device_id)
-                        _LOGGER.debug("Requested poll for device %s", device_id)
-                        poll_requested = True
-                    except InimAuthError as err:
-                        _LOGGER.debug(
-                            "RequestPoll auth error for device %s: %s, token was refreshed",
-                            device_id, err,
-                        )
-                        # Token was refreshed inside request_poll, retry once
-                        try:
-                            await self.api.request_poll(device_id)
-                            _LOGGER.debug("Requested poll for device %s after re-auth", device_id)
-                            poll_requested = True
-                        except Exception as retry_err:
-                            _LOGGER.warning("RequestPoll retry failed for device %s: %s", device_id, retry_err)
-                    except Exception as err:
-                        _LOGGER.debug("RequestPoll failed for device %s: %s", device_id, err)
-            
-            # Wait for central to send data to cloud (5 seconds required)
-            if poll_requested:
-                import asyncio
-                await asyncio.sleep(5)
-            
-            # Now get devices with all data (should have fresh state)
-            devices = await self.api.get_devices()
-            
+            async with self._sync_lock:
+                await self._async_request_polls_if_due(force=force_poll)
+                await self._async_wait_for_panel_sync()
+                devices = await self.api.get_devices()
+
             if not devices:
                 _LOGGER.warning("No devices found in INIM Cloud")
                 return {"devices": []}
-            
+
             self._devices = devices
-            
+
             # Build a structured data response
             data: dict[str, Any] = {
                 "devices": [],
             }
-            
+
             for device in devices:
                 device_data = {
                     "device_id": device.get("DeviceId"),
@@ -123,14 +109,23 @@ class InimDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     "blinds": device.get("Blinds", []),
                 }
                 data["devices"].append(device_data)
-            
+
             _LOGGER.debug("Updated data for %d devices", len(data["devices"]))
-            
+
             # Check for alarm state changes and fire events
             self._check_alarm_triggered(data)
-            
+
             return data
 
+        except InimRateLimitError as err:
+            self._force_poll_on_refresh = self._force_poll_on_refresh or force_poll
+            if self.data:
+                _LOGGER.warning(
+                    "Full INIM refresh deferred by rate limit for %.1fs; keeping current state",
+                    err.retry_after,
+                )
+                return self.data
+            raise UpdateFailed(f"Rate limited for {err.retry_after:.1f}s") from err
         except InimAuthError as err:
             _LOGGER.error("Authentication error: %s", err)
             raise UpdateFailed(f"Authentication error: {err}") from err
@@ -140,6 +135,57 @@ class InimDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         except Exception as err:
             _LOGGER.exception("Unexpected error updating INIM data")
             raise UpdateFailed(f"Unexpected error: {err}") from err
+
+    async def async_request_refresh(self) -> None:
+        """Request a full refresh after forcing panel synchronization."""
+        self._force_poll_on_refresh = True
+        await super().async_request_refresh()
+
+    async def _async_request_polls_if_due(self, force: bool = False) -> bool:
+        """Request panel synchronization for devices whose poll is due."""
+        poll_sent = False
+        now = time.monotonic()
+        interval = self._scan_interval.total_seconds()
+
+        for device in self._devices:
+            device_id = device.get("DeviceId")
+            if not device_id:
+                continue
+
+            last_poll = self._last_poll_by_device.get(device_id, 0.0)
+            if not force and last_poll and now - last_poll < interval:
+                continue
+
+            try:
+                await self.api.request_poll(device_id)
+            except InimRateLimitError:
+                raise
+            except InimAuthError as err:
+                _LOGGER.warning(
+                    "RequestPoll authentication failed for device %s: %s",
+                    device_id,
+                    err,
+                )
+            except InimApiError as err:
+                _LOGGER.warning("RequestPoll failed for device %s: %s", device_id, err)
+            else:
+                self._last_poll_by_device[device_id] = time.monotonic()
+                poll_sent = True
+                _LOGGER.debug("Requested poll for device %s", device_id)
+
+        return poll_sent
+
+    async def _async_wait_for_panel_sync(self) -> None:
+        """Wait until recent panel polls have had time to update the cloud."""
+        now = time.monotonic()
+        remaining_delays = [
+            PANEL_SYNC_DELAY - (now - self._last_poll_by_device[device_id])
+            for device in self._devices
+            if (device_id := device.get("DeviceId")) in self._last_poll_by_device
+        ]
+        delay = max(remaining_delays, default=0.0)
+        if delay > 0:
+            await asyncio.sleep(delay)
 
     def get_device(self, device_id: int) -> dict[str, Any] | None:
         """Get a specific device by ID."""
@@ -196,17 +242,17 @@ class InimDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             device_id = device.get("device_id")
             if not device_id:
                 continue
-            
+
             for area in device.get("areas", []):
                 area_id = area.get("AreaId")
                 area_name = area.get("Name", f"Area {area_id}")
                 current_alarm = area.get("Alarm", False)
                 current_armed = area.get("Armed", 4)  # 4 = disarmed
-                
+
                 key = (device_id, area_id)
                 previous_alarm = self._previous_alarm_states.get(key, False)
                 previous_armed = self._previous_armed_states.get(key)
-                
+
                 # Fire event if alarm just triggered (false -> true)
                 if current_alarm and not previous_alarm:
                     _LOGGER.warning(
@@ -222,15 +268,15 @@ class InimDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                             "area_name": area_name,
                         },
                     )
-                
+
                 # Check for armed state changes and determine source
                 if previous_armed is not None and current_armed != previous_armed:
                     self._handle_armed_state_change(
-                        device_id, area_id, area_name, 
+                        device_id, area_id, area_name,
                         device.get("name", "INIM Alarm"),
                         previous_armed, current_armed
                     )
-                
+
                 # Update state tracking
                 self._previous_alarm_states[key] = current_alarm
                 self._previous_armed_states[key] = current_armed
@@ -246,48 +292,48 @@ class InimDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     ) -> None:
         """Handle armed state change and determine source."""
         now = dt_util.now()
-        
+
         # Check if we have a pending HA command for this area
         entity_key_area = f"{device_id}_area_{area_id}"
         entity_key_main = f"{device_id}_alarm"
-        
+
         pending_key_area = (device_id, area_id)
         pending_key_main = (device_id, None)
-        
+
         # Check if there's a pending HA command (within last 60 seconds)
         is_ha_command = False
         pending_time = None
-        
+
         if pending_key_area in self._pending_ha_commands:
             pending_time = self._pending_ha_commands[pending_key_area]
             if (now - pending_time).total_seconds() < 60:
                 is_ha_command = True
                 del self._pending_ha_commands[pending_key_area]
-        
+
         if not is_ha_command and pending_key_main in self._pending_ha_commands:
             pending_time = self._pending_ha_commands[pending_key_main]
             if (now - pending_time).total_seconds() < 60:
                 is_ha_command = True
                 # Don't delete main panel pending - it might apply to multiple areas
-        
+
         # Determine the source - if HA command pending, it's from HA
         changed_by = CHANGED_BY_HOME_ASSISTANT if is_ha_command else CHANGED_BY_EXTERNAL
-        
+
         # Store change info for both area and main panel entities
         self._last_changed_by[entity_key_area] = changed_by
         self._last_changed_at[entity_key_area] = now
         self._last_changed_by[entity_key_main] = changed_by
         self._last_changed_at[entity_key_main] = now
-        
+
         # Determine state names for logging
         state_from = "armed" if previous_armed != 4 else "disarmed"
         state_to = "armed" if current_armed != 4 else "disarmed"
-        
+
         _LOGGER.info(
             "Alarm state changed: %s -> %s (Area: %s, Device: %s, Source: %s)",
             state_from, state_to, area_name, device_name, changed_by
         )
-        
+
         # Fire event
         self.hass.bus.async_fire(
             EVENT_STATE_CHANGED,
@@ -327,6 +373,49 @@ class InimDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def get_last_changed_at(self, entity_key: str) -> datetime | None:
         """Get the last changed at timestamp for an entity."""
         return self._last_changed_at.get(entity_key)
+
+    async def async_start_polling(self) -> None:
+        """Start lightweight panel synchronization polling."""
+        if self._poll_task and not self._poll_task.done():
+            return
+
+        self._poll_task = self.hass.async_create_background_task(
+            self._poll_loop(),
+            "inim_alarm panel polling",
+        )
+
+    async def async_stop_polling(self) -> None:
+        """Stop lightweight panel synchronization polling."""
+        if not self._poll_task:
+            return
+
+        self._poll_task.cancel()
+        try:
+            await self._poll_task
+        except asyncio.CancelledError:
+            pass
+        self._poll_task = None
+
+    async def _poll_loop(self) -> None:
+        """Periodically request lightweight panel-to-cloud synchronization."""
+        interval = self._scan_interval.total_seconds()
+
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                async with self._sync_lock:
+                    poll_sent = await self._async_request_polls_if_due()
+                if poll_sent:
+                    _LOGGER.debug("Completed lightweight INIM panel poll")
+            except asyncio.CancelledError:
+                raise
+            except InimRateLimitError as err:
+                _LOGGER.debug(
+                    "Skipping lightweight INIM poll during %.1fs rate limit cooldown",
+                    err.retry_after,
+                )
+            except Exception:
+                _LOGGER.exception("Unexpected error in lightweight INIM poll loop")
 
     async def async_start_websocket(self) -> None:
         """Start the WebSocket client for real-time updates."""

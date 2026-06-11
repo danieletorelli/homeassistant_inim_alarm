@@ -18,12 +18,19 @@ from homeassistant.helpers import config_validation as cv
 
 from .const import (
     CONF_ENABLE_SIA,
+    CONF_FULL_REFRESH_INTERVAL,
     CONF_SCAN_INTERVAL,
     CONF_SIA_ACCOUNT,
     CONF_SIA_PORT,
     CONF_USER_CODE,
+    DEFAULT_FULL_REFRESH_INTERVAL,
+    DEFAULT_SCAN_INTERVAL,
     DEFAULT_SIA_PORT,
     DOMAIN,
+    MAX_FULL_REFRESH_INTERVAL_SECONDS,
+    MAX_SCAN_INTERVAL_SECONDS,
+    MIN_FULL_REFRESH_INTERVAL_SECONDS,
+    MIN_SCAN_INTERVAL_SECONDS,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -50,19 +57,19 @@ async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str,
     try:
         await api.authenticate()
         devices = await api.get_devices()
-        
+
         if not devices:
             raise InimApiError("No devices found")
-        
+
         # Get the first device info for the title
         first_device = devices[0]
         title = first_device.get("Name", "INIM Alarm")
-        
+
         return {
             "title": title,
             "device_count": len(devices),
         }
-        
+
     except InimAuthError as err:
         raise InvalidAuth from err
     except InimApiError as err:
@@ -128,7 +135,7 @@ class InimAlarmConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         if user_input is not None:
             reauth_entry = self._get_reauth_entry()
-            
+
             try:
                 await validate_input(
                     self.hass,
@@ -169,22 +176,24 @@ class InvalidAuth(Exception):
 
 
 class InimAlarmOptionsFlow(config_entries.OptionsFlow):
-    """Handle options flow for INIM Alarm.
-    
-    Options only include polling interval - scenarios are no longer needed
-    since the main panel uses InsertAreas API directly.
-    """
+    """Handle options flow for INIM Alarm."""
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
         """Manage the options."""
+        errors: dict[str, str] = {}
+
         if user_input is not None:
-            return self.async_create_entry(title="", data=user_input)
+            if (
+                user_input[CONF_FULL_REFRESH_INTERVAL]
+                < user_input[CONF_SCAN_INTERVAL]
+            ):
+                errors[CONF_FULL_REFRESH_INTERVAL] = "full_refresh_too_short"
+            else:
+                return self.async_create_entry(title="", data=user_input)
 
         # Get current values
-        current_scan = self.config_entry.options.get(CONF_SCAN_INTERVAL, 30)
-
         current_sia = self.config_entry.options.get(
             CONF_ENABLE_SIA,
             self.config_entry.data.get(CONF_ENABLE_SIA, False),
@@ -197,13 +206,67 @@ class InimAlarmOptionsFlow(config_entries.OptionsFlow):
             CONF_SIA_ACCOUNT,
             self.config_entry.data.get(CONF_SIA_ACCOUNT, ""),
         )
+        current_scan_interval = self.config_entry.options.get(
+            CONF_SCAN_INTERVAL,
+            int(DEFAULT_SCAN_INTERVAL.total_seconds()),
+        )
+        current_full_refresh_interval = self.config_entry.options.get(
+            CONF_FULL_REFRESH_INTERVAL,
+            int(DEFAULT_FULL_REFRESH_INTERVAL.total_seconds()),
+        )
+        current_scan_interval = min(
+            MAX_SCAN_INTERVAL_SECONDS,
+            max(MIN_SCAN_INTERVAL_SECONDS, int(current_scan_interval)),
+        )
+        current_full_refresh_interval = min(
+            MAX_FULL_REFRESH_INTERVAL_SECONDS,
+            max(
+                MIN_FULL_REFRESH_INTERVAL_SECONDS,
+                int(current_full_refresh_interval),
+            ),
+        )
+
+        if (
+            user_input is None
+            and current_sia
+            and current_scan_interval <= DEFAULT_SCAN_INTERVAL.total_seconds()
+        ):
+            current_scan_interval = int(
+                DEFAULT_FULL_REFRESH_INTERVAL.total_seconds()
+            )
+
+        if user_input is None and current_full_refresh_interval < current_scan_interval:
+            current_full_refresh_interval = current_scan_interval
+
+        if user_input is not None:
+            current_scan_interval = user_input[CONF_SCAN_INTERVAL]
+            current_full_refresh_interval = user_input[CONF_FULL_REFRESH_INTERVAL]
+            current_sia = user_input.get(CONF_ENABLE_SIA, False)
+            current_sia_port = user_input.get(CONF_SIA_PORT, DEFAULT_SIA_PORT)
+            current_sia_account = user_input.get(CONF_SIA_ACCOUNT, "")
 
         options_schema = vol.Schema(
             {
                 vol.Required(
                     CONF_SCAN_INTERVAL,
-                    default=current_scan,
-                ): vol.All(vol.Coerce(int), vol.Range(min=10, max=300)),
+                    default=current_scan_interval,
+                ): vol.All(
+                    vol.Coerce(int),
+                    vol.Range(
+                        min=MIN_SCAN_INTERVAL_SECONDS,
+                        max=MAX_SCAN_INTERVAL_SECONDS,
+                    ),
+                ),
+                vol.Required(
+                    CONF_FULL_REFRESH_INTERVAL,
+                    default=current_full_refresh_interval,
+                ): vol.All(
+                    vol.Coerce(int),
+                    vol.Range(
+                        min=MIN_FULL_REFRESH_INTERVAL_SECONDS,
+                        max=MAX_FULL_REFRESH_INTERVAL_SECONDS,
+                    ),
+                ),
                 vol.Optional(
                     CONF_ENABLE_SIA,
                     default=current_sia,
@@ -222,4 +285,5 @@ class InimAlarmOptionsFlow(config_entries.OptionsFlow):
         return self.async_show_form(
             step_id="init",
             data_schema=options_schema,
+            errors=errors,
         )
