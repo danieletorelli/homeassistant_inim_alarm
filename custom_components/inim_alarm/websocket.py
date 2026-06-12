@@ -22,6 +22,7 @@ HEARTBEAT_TIMEOUT = (PING_INTERVAL * 2) + 30
 RECONNECT_BASE_DELAY = 3.0
 RECONNECT_MAX_DELAY = 60.0
 RECONNECT_JITTER = 0.2
+AUTH_HANDSHAKE_STATUSES = {401, 403}
 LOG_REDACTED = "**REDACTED**"
 WS_LOG_SENSITIVE_KEYS = {
     "deviceeventid",
@@ -192,6 +193,25 @@ class InimWebSocketClient:
 
             except asyncio.CancelledError:
                 raise
+            except aiohttp.WSServerHandshakeError as err:
+                if err.status in AUTH_HANDSHAKE_STATUSES:
+                    _LOGGER.warning(
+                        "WebSocket authentication rejected with HTTP %s; refreshing credentials",
+                        err.status,
+                    )
+                    try:
+                        await self._api.authenticate()
+                    except Exception as auth_err:
+                        _LOGGER.warning(
+                            "WebSocket credential refresh failed: %s",
+                            auth_err,
+                        )
+                else:
+                    _LOGGER.warning(
+                        "WebSocket handshake failed with HTTP %s: %s",
+                        err.status,
+                        err,
+                    )
             except (aiohttp.ClientError, asyncio.TimeoutError) as err:
                 _LOGGER.warning(
                     "WebSocket connection error: %s",
