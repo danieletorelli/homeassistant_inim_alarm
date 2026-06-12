@@ -288,6 +288,7 @@ automation:
 - **Credentials stay local** - Stored encrypted in Home Assistant only
 - **No third-party servers** - Direct communication with INIM Cloud only
 - **No credential logging** - Passwords/tokens never in logs
+- **Redacted API debug data** - Full state details remain available while identifiers, names, addresses, coordinates, IPs, serial numbers, and IMEI are masked
 - **HTTPS only** - All cloud communication encrypted
 - **SIA-IP local only** - Local listener never leaves your LAN
 - **Scenario buttons disabled by default** - No accidental arm/disarm without PIN

@@ -360,10 +360,11 @@ class InimApi:
         try:
             response = await self._request(request_data)
             self._devices = response.get("Data", {}).get("Devices", [])
-            _LOGGER.debug(
-                "GetDevicesExtended data: %s",
-                _redact_api_value_for_log(self._devices),
-            )
+            if _LOGGER.isEnabledFor(logging.DEBUG):
+                _LOGGER.debug(
+                    "GetDevicesExtended data: %s",
+                    _redact_api_value_for_log(self._devices),
+                )
             return self._devices
         except InimAuthError:
             # Token expired, re-authenticate and retry
