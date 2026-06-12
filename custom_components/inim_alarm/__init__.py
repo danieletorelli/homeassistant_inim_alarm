@@ -64,7 +64,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     except InimApiError as err:
         raise ConfigEntryNotReady(f"Failed to connect: {err}") from err
 
-    sia_enabled = entry.options.get(CONF_ENABLE_SIA) or entry.data.get(CONF_ENABLE_SIA)
     scan_interval_seconds = entry.options.get(
         CONF_SCAN_INTERVAL,
         int(DEFAULT_SCAN_INTERVAL.total_seconds()),
@@ -84,16 +83,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             int(full_refresh_interval_seconds),
         ),
     )
-
-    if (
-        sia_enabled
-        and scan_interval_seconds <= DEFAULT_SCAN_INTERVAL.total_seconds()
-    ):
-        scan_interval_seconds = int(DEFAULT_FULL_REFRESH_INTERVAL.total_seconds())
-        _LOGGER.info(
-            "SIA-IP enabled: panel poll interval raised to %ds (fallback only)",
-            scan_interval_seconds,
-        )
 
     if full_refresh_interval_seconds < scan_interval_seconds:
         _LOGGER.warning(

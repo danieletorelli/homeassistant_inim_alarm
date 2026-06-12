@@ -46,12 +46,16 @@
           "sia_account": "Account SIA (opzionale)"
         },
         "data_description": {
-          "scan_interval": "Frequenza delle richieste leggere di sincronizzazione centrale-cloud (20-300 secondi)",
+          "scan_interval": "Frequenza delle richieste leggere di sincronizzazione centrale-cloud (20-3600 secondi). Il polling frequente può essere limitato; i valori a rischio richiedono conferma.",
           "full_refresh_interval": "Frequenza di download e riconciliazione dello stato completo (60-3600 secondi)",
           "enable_sia": "Abilita il listener TCP SIA-IP locale per aggiornamenti in tempo reale dal pannello",
           "sia_port": "Porta TCP per il listener SIA-IP (default: 6001)",
           "sia_account": "Filtra messaggi per ID account SIA. Lascia vuoto per accettare tutti."
         }
+      },
+      "confirm_polling": {
+        "title": "Conferma polling frequente della centrale",
+        "description": "Un intervallo di {scan_interval} secondi genera circa {polls_per_day} chiamate RequestPoll ordinarie al giorno per ogni dispositivo. INIM Cloud può limitare il polling frequente e i comandi possono aggiungere altre chiamate. Conferma per mantenere questo intervallo oppure torna indietro e scegline uno maggiore."
       }
     },
     "error": {

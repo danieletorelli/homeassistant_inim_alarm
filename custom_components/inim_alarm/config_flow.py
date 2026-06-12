@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any
 
 import voluptuous as vol
@@ -31,6 +32,8 @@ from .const import (
     MAX_SCAN_INTERVAL_SECONDS,
     MIN_FULL_REFRESH_INTERVAL_SECONDS,
     MIN_SCAN_INTERVAL_SECONDS,
+    POLL_BUDGET_WARNING_PER_DAY,
+    SECONDS_PER_DAY,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -178,6 +181,11 @@ class InvalidAuth(Exception):
 class InimAlarmOptionsFlow(config_entries.OptionsFlow):
     """Handle options flow for INIM Alarm."""
 
+    def __init__(self) -> None:
+        """Initialize the options flow."""
+        super().__init__()
+        self._pending_options: dict[str, Any] | None = None
+
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
@@ -191,6 +199,21 @@ class InimAlarmOptionsFlow(config_entries.OptionsFlow):
             ):
                 errors[CONF_FULL_REFRESH_INTERVAL] = "full_refresh_too_short"
             else:
+                polls_per_day = math.ceil(
+                    SECONDS_PER_DAY / user_input[CONF_SCAN_INTERVAL]
+                )
+                if polls_per_day > POLL_BUDGET_WARNING_PER_DAY:
+                    self._pending_options = user_input
+                    return self.async_show_form(
+                        step_id="confirm_polling",
+                        data_schema=vol.Schema({}),
+                        description_placeholders={
+                            "polls_per_day": str(polls_per_day),
+                            "scan_interval": str(
+                                user_input[CONF_SCAN_INTERVAL]
+                            ),
+                        },
+                    )
                 return self.async_create_entry(title="", data=user_input)
 
         # Get current values
@@ -228,14 +251,8 @@ class InimAlarmOptionsFlow(config_entries.OptionsFlow):
 
         if (
             user_input is None
-            and current_sia
-            and current_scan_interval <= DEFAULT_SCAN_INTERVAL.total_seconds()
+            and current_full_refresh_interval < current_scan_interval
         ):
-            current_scan_interval = int(
-                DEFAULT_FULL_REFRESH_INTERVAL.total_seconds()
-            )
-
-        if user_input is None and current_full_refresh_interval < current_scan_interval:
             current_full_refresh_interval = current_scan_interval
 
         if user_input is not None:
@@ -286,4 +303,28 @@ class InimAlarmOptionsFlow(config_entries.OptionsFlow):
             step_id="init",
             data_schema=options_schema,
             errors=errors,
+        )
+
+    async def async_step_confirm_polling(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Confirm a polling interval with high routine API usage."""
+        if user_input is not None and self._pending_options is not None:
+            return self.async_create_entry(
+                title="",
+                data=self._pending_options,
+            )
+
+        if self._pending_options is None:
+            return await self.async_step_init()
+
+        scan_interval = self._pending_options[CONF_SCAN_INTERVAL]
+        polls_per_day = math.ceil(SECONDS_PER_DAY / scan_interval)
+        return self.async_show_form(
+            step_id="confirm_polling",
+            data_schema=vol.Schema({}),
+            description_placeholders={
+                "polls_per_day": str(polls_per_day),
+                "scan_interval": str(scan_interval),
+            },
         )

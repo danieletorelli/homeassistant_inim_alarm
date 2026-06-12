@@ -99,11 +99,21 @@ Go to **Settings** → **Devices & Services** → **INIM Alarm** → **Configure
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| **Polling Interval** | How often to request panel-to-cloud synchronization (20-300s) | 30s (300s if SIA-IP enabled) |
+| **Polling Interval** | How often to request panel-to-cloud synchronization (20-3600s) | 30s |
 | **Full Refresh Interval** | How often to reconcile the complete state (60-3600s) | 300s |
 | **Enable SIA-IP** | Enable local SIA-IP TCP listener | Off |
 | **SIA-IP Port** | TCP port for SIA-IP listener | 6001 |
 | **SIA Account ID** | Filter by SIA account (leave empty for all) | Empty |
+
+The polling interval controls the routine `RequestPoll` budget. Approximate calls per day for each configured device are calculated as `86400 / polling interval`; commands can add further calls. Values producing more than 220 routine polls per day require explicit confirmation in the options flow. The default remains compatible with upstream behavior, but it is intentionally confirmed when selected because it can exceed the observed cloud allowance.
+
+| Polling interval | Routine polls/day/device |
+|------------------|--------------------------|
+| 300s | 288 |
+| 360s | 240 |
+| 420s | 206 |
+| 480s | 180 |
+| 600s | 144 |
 
 ### SIA-IP Setup (Optional)
 
