@@ -209,10 +209,11 @@ class InimWebSocketClient:
 
     def _handle_message(self, text: str) -> None:
         """Parse and dispatch a WebSocket message."""
-        _LOGGER.debug(
-            "WS message: %r",
-            _redact_ws_message_for_log(text),
-        )
+        if _LOGGER.isEnabledFor(logging.DEBUG):
+            _LOGGER.debug(
+                "WS message: %r",
+                _redact_ws_message_for_log(text),
+            )
 
         if text == HEARTBEAT_PAYLOAD:
             _LOGGER.debug("Received INIM WS heartbeat")
