@@ -361,7 +361,7 @@ class InimApi:
             response = await self._request(request_data)
             self._devices = response.get("Data", {}).get("Devices", [])
             _LOGGER.debug(
-                "GetDevicesExtended data (sensitive values redacted): %s",
+                "GetDevicesExtended data: %s",
                 _redact_api_value_for_log(self._devices),
             )
             return self._devices
