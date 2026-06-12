@@ -26,7 +26,7 @@ A Home Assistant custom integration for INIM alarm systems (SmartLiving, Prime, 
 - 🌡️ **Temperature Sensors** - Monitor JOY MAX keyboard temperatures
 - ⚠️ **Fault Sensors** - Monitor system faults
 - 🎬 **Scenario Buttons** - Quick buttons to activate any scenario (disabled by default for security)
-- ⚙️ **Configurable Options** - Customize polling interval and SIA-IP settings
+- ⚙️ **Configurable Options** - Customize panel polling, full refresh, and SIA-IP settings
 - 🔄 **Automatic token refresh** - Handles token expiration automatically
 - 🌍 **Multi-language** - English and Italian translations
 
@@ -36,13 +36,15 @@ The integration supports three communication channels for maximum reliability an
 
 | Channel | Latency | Direction | Use Case |
 |---------|---------|-----------|----------|
-| **REST API** (polling) | ~35s | HA → Cloud → Panel | Full state refresh (fallback) |
+| **REST API** (panel poll) | Configurable | HA → Cloud → Panel | Trigger panel-to-cloud synchronization |
+| **REST API** (full refresh) | Configurable | HA → Cloud | Reconcile complete device state |
 | **WebSocket** (cloud push) | 1-3s | Panel → Cloud → HA | Alarm events, arming/disarming |
 | **SIA-IP** (local push) | < 1s | Panel → HA (direct LAN) | Zone open/close, tamper, burglar alarm |
 
 - **WebSocket** is always active and provides near-instant notifications for alarm-critical events (sirens, arming state changes) via INIM Cloud.
 - **SIA-IP** is an optional local listener that receives SIA-DC09 messages directly from the panel over your LAN — no cloud dependency, sub-second latency for all sensor events.
-- **Polling** acts as a safety net to reconcile state. When SIA-IP is enabled, polling is automatically reduced to every 5 minutes.
+- **Panel polling** uses the lightweight `RequestPoll` call to prompt the panel to synchronize changes with INIM Cloud.
+- **Full refresh** periodically downloads all device data as a safety net. HTTP 429 responses activate a shared cooldown with automatic backoff.
 
 ## 📋 Supported Devices
 
@@ -97,10 +99,21 @@ Go to **Settings** → **Devices & Services** → **INIM Alarm** → **Configure
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| **Polling Interval** | How often to poll for full state update (10-300s) | 30s (300s if SIA-IP enabled) |
+| **Polling Interval** | How often to request panel-to-cloud synchronization (20-3600s) | 30s |
+| **Full Refresh Interval** | How often to reconcile the complete state (60-3600s) | 300s |
 | **Enable SIA-IP** | Enable local SIA-IP TCP listener | Off |
 | **SIA-IP Port** | TCP port for SIA-IP listener | 6001 |
 | **SIA Account ID** | Filter by SIA account (leave empty for all) | Empty |
+
+The polling interval controls the routine `RequestPoll` budget. Approximate calls per day for each configured device are calculated as `86400 / polling interval`; commands can add further calls. Values producing more than 220 routine polls per day require explicit confirmation in the options flow. The default remains compatible with upstream behavior, but it is intentionally confirmed when selected because it can exceed the observed cloud allowance.
+
+| Polling interval | Routine polls/day/device |
+|------------------|--------------------------|
+| 300s | 288 |
+| 360s | 240 |
+| 420s | 206 |
+| 480s | 180 |
+| 600s | 144 |
 
 ### SIA-IP Setup (Optional)
 
@@ -285,6 +298,7 @@ automation:
 - **Credentials stay local** - Stored encrypted in Home Assistant only
 - **No third-party servers** - Direct communication with INIM Cloud only
 - **No credential logging** - Passwords/tokens never in logs
+- **Redacted API debug data** - Full state details remain available while identifiers, names, addresses, coordinates, IPs, serial numbers, and IMEI are masked
 - **HTTPS only** - All cloud communication encrypted
 - **SIA-IP local only** - Local listener never leaves your LAN
 - **Scenario buttons disabled by default** - No accidental arm/disarm without PIN
@@ -296,8 +310,9 @@ automation:
 - Check internet connection
 
 ### Entities not updating
-- Check polling interval in options
+- Check both panel poll and full refresh intervals in options
 - WebSocket updates should appear in debug logs
+- Check logs for HTTP 429 cooldown messages
 - If using SIA-IP, verify the panel can reach HA on the configured port
 - Enable debug logging (see below)
 

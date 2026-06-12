@@ -21,12 +21,19 @@ from .const import (
     ATTR_SCENARIO_ID,
     ATTR_ZONE_ID,
     CONF_ENABLE_SIA,
+    CONF_FULL_REFRESH_INTERVAL,
     CONF_SCAN_INTERVAL,
     CONF_SIA_ACCOUNT,
     CONF_SIA_PORT,
     CONF_USER_CODE,
+    DEFAULT_FULL_REFRESH_INTERVAL,
+    DEFAULT_SCAN_INTERVAL,
     DEFAULT_SIA_PORT,
     DOMAIN,
+    MAX_FULL_REFRESH_INTERVAL_SECONDS,
+    MAX_SCAN_INTERVAL_SECONDS,
+    MIN_FULL_REFRESH_INTERVAL_SECONDS,
+    MIN_SCAN_INTERVAL_SECONDS,
     PLATFORMS,
     SERVICE_ACTIVATE_SCENARIO,
     SERVICE_BYPASS_ZONE,
@@ -36,17 +43,14 @@ from .sia_server import async_start_sia_server
 
 _LOGGER = logging.getLogger(__name__)
 
-# PLATFORMS imported from const.py includes: alarm_control_panel, binary_sensor, button, sensor, switch
 
-DEFAULT_SCAN_INTERVAL_SECONDS = 30
-# When SIA-IP is active, polling is only a fallback for state reconciliation
-SIA_FALLBACK_SCAN_INTERVAL_SECONDS = 300
+# PLATFORMS imported from const.py includes: alarm_control_panel, binary_sensor, button, sensor, switch
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up INIM Alarm from a config entry."""
     session = async_get_clientsession(hass)
-    
+
     api = InimApi(
         username=entry.data[CONF_USERNAME],
         password=entry.data[CONF_PASSWORD],
@@ -60,20 +64,43 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     except InimApiError as err:
         raise ConfigEntryNotReady(f"Failed to connect: {err}") from err
 
-    # Get scan interval from options or use default
-    sia_enabled = entry.options.get(CONF_ENABLE_SIA) or entry.data.get(CONF_ENABLE_SIA)
-    scan_interval_seconds = entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL_SECONDS)
-    if sia_enabled and scan_interval_seconds <= DEFAULT_SCAN_INTERVAL_SECONDS:
-        # SIA-IP provides real-time local updates, polling is just a fallback
-        scan_interval_seconds = SIA_FALLBACK_SCAN_INTERVAL_SECONDS
-        _LOGGER.info(
-            "SIA-IP enabled: polling interval raised to %ds (fallback only)",
+    scan_interval_seconds = entry.options.get(
+        CONF_SCAN_INTERVAL,
+        int(DEFAULT_SCAN_INTERVAL.total_seconds()),
+    )
+    full_refresh_interval_seconds = entry.options.get(
+        CONF_FULL_REFRESH_INTERVAL,
+        int(DEFAULT_FULL_REFRESH_INTERVAL.total_seconds()),
+    )
+    scan_interval_seconds = min(
+        MAX_SCAN_INTERVAL_SECONDS,
+        max(MIN_SCAN_INTERVAL_SECONDS, int(scan_interval_seconds)),
+    )
+    full_refresh_interval_seconds = min(
+        MAX_FULL_REFRESH_INTERVAL_SECONDS,
+        max(
+            MIN_FULL_REFRESH_INTERVAL_SECONDS,
+            int(full_refresh_interval_seconds),
+        ),
+    )
+
+    if full_refresh_interval_seconds < scan_interval_seconds:
+        _LOGGER.warning(
+            "Full refresh interval %ds is shorter than scan interval %ds; "
+            "using %ds for both",
+            full_refresh_interval_seconds,
+            scan_interval_seconds,
             scan_interval_seconds,
         )
-    update_interval = timedelta(seconds=scan_interval_seconds)
+        full_refresh_interval_seconds = scan_interval_seconds
 
-    coordinator = InimDataUpdateCoordinator(hass, api, update_interval)
-    
+    coordinator = InimDataUpdateCoordinator(
+        hass,
+        api,
+        update_interval=timedelta(seconds=full_refresh_interval_seconds),
+        scan_interval=timedelta(seconds=scan_interval_seconds),
+    )
+
     # Fetch initial data
     await coordinator.async_config_entry_first_refresh()
 
@@ -83,6 +110,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         "coordinator": coordinator,
         "options": {
             CONF_SCAN_INTERVAL: scan_interval_seconds,
+            CONF_FULL_REFRESH_INTERVAL: full_refresh_interval_seconds,
             # User code from entry.data (setup) with fallback to options (legacy)
             CONF_USER_CODE: entry.data.get(CONF_USER_CODE, entry.options.get(CONF_USER_CODE, "")),
         },
@@ -92,6 +120,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     # Start WebSocket for real-time updates
     await coordinator.async_start_websocket()
+    await coordinator.async_start_polling()
 
     # Start SIA-IP server if enabled
     sia_server = None
@@ -132,6 +161,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         data = hass.data[DOMAIN].pop(entry.entry_id)
         coordinator = data.get("coordinator")
         if coordinator:
+            await coordinator.async_stop_polling()
             await coordinator.async_stop_websocket()
         sia_server = data.get("sia_server")
         if sia_server:
@@ -170,7 +200,7 @@ SERVICE_ACTIVATE_SCENARIO_SCHEMA = vol.Schema(
 
 async def async_register_services(hass: HomeAssistant) -> None:
     """Register services for INIM Alarm."""
-    
+
     if hass.services.has_service(DOMAIN, SERVICE_BYPASS_ZONE):
         return  # Already registered
 
@@ -188,7 +218,7 @@ async def async_register_services(hass: HomeAssistant) -> None:
                 # Use provided code or get from options
                 if not user_code:
                     user_code = data.get("options", {}).get(CONF_USER_CODE, "")
-                
+
                 if not user_code:
                     _LOGGER.error(
                         "No user code provided. Set it in integration options or provide it in service call"

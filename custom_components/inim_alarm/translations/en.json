@@ -37,20 +37,29 @@
     "step": {
       "init": {
         "title": "INIM Alarm Options",
-        "description": "Configure polling interval and SIA-IP local listener.",
+        "description": "Configure panel synchronization, full state refresh, and the SIA-IP local listener.",
         "data": {
           "scan_interval": "Polling interval (seconds)",
+          "full_refresh_interval": "Full refresh interval (seconds)",
           "enable_sia": "Enable SIA-IP listener",
           "sia_port": "SIA-IP port",
           "sia_account": "SIA Account ID (optional)"
         },
         "data_description": {
-          "scan_interval": "How often to poll for updates (10-300 seconds)",
+          "scan_interval": "How often to request lightweight panel-to-cloud synchronization (20-3600 seconds). Frequent polling may be rate-limited; risky values require confirmation.",
+          "full_refresh_interval": "How often to download and reconcile the complete device state (60-3600 seconds)",
           "enable_sia": "Enable local SIA-IP TCP listener for real-time updates from the panel",
           "sia_port": "TCP port for the SIA-IP listener (default: 6001)",
           "sia_account": "Filter messages by SIA account ID. Leave empty to accept all."
         }
+      },
+      "confirm_polling": {
+        "title": "Confirm frequent panel polling",
+        "description": "A {scan_interval}-second interval schedules approximately {polls_per_day} routine RequestPoll calls per day for each device. INIM Cloud may rate-limit frequent polling, and commands can add more calls. Submit to keep this interval or go back to choose a longer one."
       }
+    },
+    "error": {
+      "full_refresh_too_short": "Full refresh interval must be greater than or equal to the polling interval"
     }
   },
   "services": {
